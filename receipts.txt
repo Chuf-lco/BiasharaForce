@@ -1,0 +1,3 @@
+{"amount": 20000, "sender": "JANE DOE 254712345678", "tax_details": "5% withholding tax calculated as: (20000 * 0.05)"}
+{"amount": 20000, "reason": "Rent on 24/5/24", "sender": "JANE DOE", "tax_details": {"description": "5% Withholding Tax", "tax_amount": 1000}}
+{"amount": 20000, "sender": "JANE DOE", "tax_amount": 1000, "tax_details": "5% withholding tax applied"}
