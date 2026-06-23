@@ -19,19 +19,26 @@ app = FastAPI()
 groq_client = Groq()
 
 # Initialize Africa's Talking
-AT_USERNAME = os.getenv("AT_USERNAME", "sandbox")
-AT_API_KEY = os.getenv("AT_API_KEY", "fake_key")
+AT_USERNAME = os.getenv("AT_USERNAME")
+AT_API_KEY = os.getenv("AT_API_KEY")
 
-if AT_USERNAME == "fake_key":
-    print("⚠️ WARNING: Africa's Talking API Key is missing in Render Environment Variables!")
-    
+# Debug print to see what the server is actually reading (only prints first 5 chars for safety)
+if AT_API_KEY:
+    print(f"🔍 Found AT API Key starting with: {AT_API_KEY[:5]}...")
+else:
+    print("❌ CRITICAL: AT_API_KEY environment variable is completely missing!")
+
+# For the cloud, we default to 'sandbox' if no username is provided
+if not AT_USERNAME:
+    AT_USERNAME = "sandbox"
+
 try:
     africastalking.initialize(AT_USERNAME, AT_API_KEY)
     sms = africastalking.SMS 
+    print("✅ Africa's Talking SDK Initialized Successfully!")
 except Exception as e:
-    print(f"⚠️ Could not initialize Africa's Talking: {e}")
-    sms = None 
-
+    print(f"❌ Could not initialize Africa's Talking: {e}")
+    sms = None
 # ==========================================
 # 1. DATABASE SETUP
 # ==========================================
