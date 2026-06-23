@@ -1,3 +1,4 @@
+import requests
 from fastapi import FastAPI, Request, Response
 from groq import Groq
 import africastalking
@@ -5,8 +6,8 @@ from dotenv import load_dotenv
 import os
 import json
 import sqlite3
-from fpdf import FPDF
 import datetime
+from fpdf import FPDF
 
 # Load env vars
 load_dotenv()
@@ -29,6 +30,8 @@ sms = africastalking.SMS
 def init_db():
     conn = sqlite3.connect('biasharaforce.db')
     c = conn.cursor()
+    
+    # Main transactions table
     c.execute('''CREATE TABLE IF NOT EXISTS transactions
                  (id INTEGER PRIMARY KEY AUTOINCREMENT,
                  sender_phone TEXT,
@@ -37,6 +40,15 @@ def init_db():
                  tax_amount REAL,
                  reason TEXT,
                  timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
+                 
+    # NEW: Pending actions table for Human-in-the-Loop
+    c.execute('''CREATE TABLE IF NOT EXISTS pending_actions
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 action_type TEXT,
+                 action_data TEXT,
+                 status TEXT DEFAULT 'pending',
+                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
+                 
     conn.commit()
     conn.close()
 
@@ -57,7 +69,6 @@ def check_customer_history(sender_phone: str) -> str:
     c.execute("SELECT sender_name, amount, reason, timestamp FROM transactions WHERE sender_phone=?", (sender_phone,))
     rows = c.fetchall()
     conn.close()
-    
     if not rows:
         return "No past transactions found for this phone number. This is a new customer."
     else:
@@ -78,11 +89,8 @@ def save_transaction_to_db(sender_phone: str, sender_name: str, amount: float, t
 def generate_invoice_pdf(sender_name: str, amount: float, tax_amount: float, reason: str) -> str:
     if not os.path.exists('invoices'):
         os.makedirs('invoices')
-
-    #Add a timestamp to the filename to ensure uniqueness
-    timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")  
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"invoices/invoice_{sender_name.replace(' ', '_')}_{amount}_{timestamp}.pdf"
-
     pdf = FPDF()
     pdf.add_page()
     pdf.set_font("Helvetica", "B", 24)
@@ -90,23 +98,86 @@ def generate_invoice_pdf(sender_name: str, amount: float, tax_amount: float, rea
     pdf.set_font("Helvetica", "", 12)
     pdf.cell(0, 10, "Powered by AI Agents", ln=True, align="C")
     pdf.ln(20)
-    
     pdf.set_font("Helvetica", "B", 14)
     pdf.cell(0, 10, f"Client: {sender_name}", ln=True)
     pdf.ln(5)
-    
     pdf.set_font("Helvetica", "", 12)
     pdf.cell(0, 10, f"Description: {reason}", ln=True)
     pdf.cell(0, 10, f"Subtotal: Ksh {amount:,.2f}", ln=True)
-    
     if tax_amount > 0:
         pdf.cell(0, 10, f"Withholding Tax (5%): Ksh {tax_amount:,.2f}", ln=True)
         pdf.cell(0, 10, f"Net Payable: Ksh {amount - tax_amount:,.2f}", ln=True)
     else:
         pdf.cell(0, 10, f"Total: Ksh {amount:,.2f}", ln=True)
-        
     pdf.output(filename)
     return f"Invoice successfully generated at {filename}"
+
+#Audio Transcription Tool
+def transcribe_audio(audio_url: str) -> str:
+    """Downloads audio from a URL and transcribes it using Groq Whisper."""
+    try:
+        # 1. Download the audio file from WhatsApp
+        # In production, this URL requires authentication, but we build the logic now
+        response = requests.get(audio_url)
+        audio_content = response.content
+        
+        # 2. Send to Groq Whisper for transcription
+        # We specify 'sw' for Swahili, but Whisper is smart enough to handle English/Sheng mix
+        transcription = groq_client.audio.transcriptions.create(
+            file=("voice_note.ogg", audio_content),
+            model="whisper-large-v3",
+            response_format="text",
+            language="sw" 
+        )
+        print(f"🎙️ Transcription: {transcription}")
+        return transcription
+        
+    except Exception as e:
+        print(f"❌ Error transcribing audio: {e}")
+        return "Error: Could not transcribe audio."
+    
+# NEW TOOLS: Pause and Confirm Actions
+def create_pending_action(action_type: str, action_data: dict) -> str:
+    """Saves a dangerous action as 'pending' so the user must confirm it."""
+    conn = sqlite3.connect('biasharaforce.db')
+    c = conn.cursor()
+    c.execute("INSERT INTO pending_actions (action_type, action_data) VALUES (?, ?)",
+              (action_type, json.dumps(action_data)))
+    conn.commit()
+    conn.close()
+    return "Action saved as pending. You MUST ask the user to confirm by replying YES."
+
+def confirm_pending_action() -> str:
+    """Executes the most recent pending action."""
+    conn = sqlite3.connect('biasharaforce.db')
+    c = conn.cursor()
+    c.execute("SELECT id, action_type, action_data FROM pending_actions WHERE status='pending' ORDER BY timestamp DESC LIMIT 1")
+    row = c.fetchone()
+    
+    if not row:
+        conn.close()
+        return "No pending actions to confirm."
+        
+    action_id, action_type, action_data_json = row
+    action_data = json.loads(action_data_json)
+    
+    # Mark as confirmed
+    c.execute("UPDATE pending_actions SET status='confirmed' WHERE id=?", (action_id,))
+    conn.commit()
+    conn.close()
+    
+    # Now execute the actual tools!
+    if action_type == "high_value_transaction":
+        save_transaction_to_db(**action_data)
+        generate_invoice_pdf(
+            sender_name=action_data["sender_name"],
+            amount=action_data["amount"],
+            tax_amount=action_data["tax_amount"],
+            reason=action_data["reason"]
+        )
+        return "High value transaction confirmed, saved, and invoice generated!"
+        
+    return "Action confirmed and executed."
 
 # ==========================================
 # 3. TOOL DEFINITIONS FOR THE LLM
@@ -170,6 +241,32 @@ tools = [
                 "required": ["sender_name", "amount", "tax_amount", "reason"],
             },
         },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_pending_action",
+            "description": "Pauses a dangerous or high-value transaction and marks it as pending until the user confirms.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action_type": {"type": "string", "description": "The type of action, e.g., 'high_value_transaction'"},
+                    "action_data": {"type": "object", "description": "The data needed to execute the action later"}
+                },
+                "required": ["action_type", "action_data"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "confirm_pending_action",
+            "description": "If the user replies YES to confirm a pending action, execute it.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+            },
+        },
     }
 ]
 
@@ -179,17 +276,23 @@ tools = [
 def process_mpesa_with_agent(sms_text: str, sender_phone: str) -> str:
     system_prompt = """
     You are BiasharaForce, a Kenyan Business Accounting Agent. 
-    You process M-Pesa messages. You must follow these steps in order using your tools. 
-    YOU MUST USE EVERY TOOL LISTED BELOW. DO NOT SKIP ANY STEPS.
+    You process M-Pesa messages. 
     
-    1. Extract the sender's Name, Phone, Amount, and Reason from the message text.
-    2. Use the check_customer_history tool using the extracted Phone number.
-    3. If the Reason contains 'Rent', use the calculate_withholding_tax tool. Otherwise, tax is 0.
-    4. Use the save_transaction_to_db tool using the extracted details.
-    5. Use the generate_invoice_pdf tool using the extracted details.
-    6. Finally, reply to the user with an SMS summary. Greet them by Name. If the history tool found past transactions, say "Welcome back!". If not, say "Welcome!".
+    CRITICAL RULES FOR HUMAN-IN-THE-LOOP:
+    - If the message is exactly 'YES' or 'NDIO', you MUST use the `confirm_pending_action` tool. Do not do anything else.
+    - If the transaction amount is GREATER THAN 10,000 Ksh, OR the reason contains high-value items like 'TV', 'Laptop', or 'Car', you MUST treat this as a high-value transaction. Use `create_pending_action` and ask for confirmation.
     
-    Do not output any text to the user until ALL tool steps are completely finished.
+    CRITICAL RULES FOR TAX:
+    - ONLY call `calculate_withholding_tax` if the Reason contains the word 'Rent'. 
+    - If the reason is ANYTHING ELSE (Internet, Airtime, Tomatoes, etc.), DO NOT call the tax tool. The tax is strictly 0.
+    
+    STANDARD WORKFLOW:
+    1. Check customer history.
+    2. Extract details. Apply Tax ONLY if Rent.
+    3. Save to DB (tax will be 0 if not rent). Generate PDF.
+    4. Reply with summary.
+    
+    DO NOT output code snippets. Use the tools via the API.
     """
     
     messages = [
@@ -226,6 +329,10 @@ def process_mpesa_with_agent(sms_text: str, sender_phone: str) -> str:
                 result = save_transaction_to_db(**function_args)
             elif function_name == "generate_invoice_pdf":
                 result = generate_invoice_pdf(**function_args)
+            elif function_name == "create_pending_action":
+                result = create_pending_action(**function_args)
+            elif function_name == "confirm_pending_action":
+                result = confirm_pending_action()
             else:
                 result = "Unknown function"
                 
@@ -242,19 +349,33 @@ def process_mpesa_with_agent(sms_text: str, sender_phone: str) -> str:
 async def at_webhook(request: Request):
     try:
         form_data = await request.form()
-        incoming_msg = form_data.get("text", "")
+        
+        # Check if it's a Voice Note (Media) or Text
+        media_url = form_data.get("MediaUrl0") # AT sends media URLs with this key
+        incoming_text = form_data.get("text", "")
         sender_phone = form_data.get("from", "")
         
-        if not incoming_msg:
+        if media_url:
+            print(f"🎙️ Received Voice Note from {sender_phone}")
+            # Transcribe the audio first, then process the text!
+            incoming_msg = transcribe_audio(media_url)
+        elif incoming_text:
+            print(f"📥 Received Text from {sender_phone}: {incoming_text}")
+            incoming_msg = incoming_text
+        else:
             return Response(content="No message", status_code=200)
 
-        print(f"📥 Received AT message from {sender_phone}: {incoming_msg}")
-        
+        # Send the message (either transcribed or typed) to our Groq Agent
         agent_reply = process_mpesa_with_agent(incoming_msg, sender_phone)
         
         print(f"✅ SUCCESS! AGENT REPLY GENERATED:\n{agent_reply}")
         
-        return Response(content=agent_reply, media_type="text/plain")
+        try:
+            sms.send(agent_reply, [sender_phone])
+        except Exception as sms_error:
+            pass 
+             
+        return Response(content="OK", status_code=200)
 
     except Exception as e:
         print(f"❌ CRITICAL ERROR IN WEBHOOK: {e}")
@@ -262,4 +383,4 @@ async def at_webhook(request: Request):
 
 @app.get("/")
 async def root():
-    return {"message": "BiasharaForce DB + PDF Agent is running!"}
+    return {"message": "BiasharaForce HITL Agent is running!"}

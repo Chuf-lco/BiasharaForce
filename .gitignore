@@ -1,4 +1,6 @@
 .env
+biasharaforce.db
+invoices/
 __pycache__/
 *.pyc
 
