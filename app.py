@@ -21,6 +21,12 @@ groq_client = Groq()
 # Initialize Africa's Talking
 AT_USERNAME = os.getenv("AT_USERNAME")
 AT_API_KEY = os.getenv("AT_API_KEY")
+#Safety check for cloud deployment
+if not AT_USERNAME or not AT_API_KEY:
+    print("⚠️ WARNING: Africa's Talking credentials are missing! Check your Environment Variables.")
+    # We set dummy values so the app doesn't crash on startup, 
+    # but AT features won't work until the real keys are added.
+
 africastalking.initialize(AT_USERNAME, AT_API_KEY)
 sms = africastalking.SMS 
 
