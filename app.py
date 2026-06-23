@@ -356,39 +356,53 @@ def process_mpesa_with_agent(sms_text: str, sender_phone: str) -> str:
 @app.post("/whatsapp")
 async def at_webhook(request: Request):
     try:
+        # 1. Parse incoming form data from Africa's Talking
         form_data = await request.form()
         
-        # Check if it's a Voice Note (Media) or Text
-        media_url = form_data.get("MediaUrl0") # AT sends media URLs with this key
+        # AT sends 'text' for SMS and 'MediaUrl0' for Voice Notes
+        media_url = form_data.get("MediaUrl0")
         incoming_text = form_data.get("text", "")
         sender_phone = form_data.get("from", "")
         
+        incoming_msg = ""
+        
+        # 2. Handle Voice Notes vs Text
         if media_url:
             print(f"🎙️ Received Voice Note from {sender_phone}")
-            # Transcribe the audio first, then process the text!
             incoming_msg = transcribe_audio(media_url)
         elif incoming_text:
             print(f"📥 Received Text from {sender_phone}: {incoming_text}")
             incoming_msg = incoming_text
         else:
+            print("⚠️ Received empty message.")
             return Response(content="No message", status_code=200)
 
-        # Send the message (either transcribed or typed) to our Groq Agent
-        agent_reply = process_mpesa_with_agent(incoming_msg, sender_phone)
-        
-        print(f"✅ SUCCESS! AGENT REPLY GENERATED:\n{agent_reply}")
-        
-        try:
-            sms.send(agent_reply, [sender_phone])
-        except Exception as sms_error:
-            pass 
-             
+        # 3. Process the message with your Groq Agent
+        if incoming_msg and "Error:" not in incoming_msg:
+            agent_reply = process_mpesa_with_agent(incoming_msg, sender_phone)
+            print(f"✅ AGENT REPLY GENERATED:\n{agent_reply}")
+            
+            # 4. ACTIVELY PUSH REPLY VIA AT SDK (Crucial for Cloud/SMS!)
+            # In the cloud, returning text in the HTTP response doesn't send the SMS.
+            # We must use the SDK to push the message back to the user.
+            try:
+                if sms: # Check if the SDK initialized properly
+                    response = sms.send(agent_reply, [sender_phone])
+                    print(f"📱 AT SDK Reply Sent! Response: {response}")
+                else:
+                    print("❌ SMS SDK not initialized. Check AT API Keys in Render Environment Variables.")
+            except Exception as sms_error:
+                print(f"❌ Failed to send SMS via SDK: {sms_error}")
+        else:
+            print(f"⚠️ Skipping agent processing. Transcription failed or message was empty.")
+
+        # 5. Always return 200 OK immediately so AT stops retrying
         return Response(content="OK", status_code=200)
 
     except Exception as e:
         print(f"❌ CRITICAL ERROR IN WEBHOOK: {e}")
-        return Response(content="Server Error", status_code=500)
-
+        # Still return 200 OK to AT even if our code crashes, so they don't spam us
+        return Response(content="Server Error", status_code=200)
 @app.get("/")
 async def root():
     return {"message": "BiasharaForce HITL Agent is running!"}
