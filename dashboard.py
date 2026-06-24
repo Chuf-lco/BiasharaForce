@@ -1,6 +1,7 @@
 import streamlit as st
-import sqlite3
 import pandas as pd
+import os
+from sqlalchemy import create_engine, text
 
 # Page configuration
 st.set_page_config(page_title="BiasharaForce Dashboard", page_icon="📈", layout="wide")
@@ -12,17 +13,32 @@ if st.button("🔄 Refresh Data"):
     st.cache_data.clear()
     st.rerun()
 
-# Connect to the database
+# Connect to Supabase Postgres Database
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+# Fallback for Streamlit Community Cloud Secrets
+if not DATABASE_URL:
+    try:
+        DATABASE_URL = st.secrets["DATABASE_URL"]
+    except:
+        st.error("🚨 DATABASE_URL is missing! Please add it to Streamlit Secrets.")
+        st.stop()
+
+# Render/SQLAlchemy requires "postgresql://" instead of "postgres://"
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
 @st.cache_resource
 def get_connection():
-    return sqlite3.connect('biasharaforce.db', check_same_thread=False)
+    return create_engine(DATABASE_URL)
 
-conn = get_connection()
+engine = get_connection()
 
 # Load data
-@st.cache_data(ttl=10)
+@st.cache_data(ttl=10) # Auto-refresh every 10 seconds
 def load_data():
-    df = pd.read_sql_query("SELECT * FROM transactions ORDER BY timestamp DESC", conn)
+    with engine.connect() as conn:
+        df = pd.read_sql_query(text("SELECT * FROM transactions ORDER BY timestamp DESC"), conn)
     return df
 
 df = load_data()
@@ -30,14 +46,9 @@ df = load_data()
 # SIDEBAR FILTERS
 st.sidebar.header("Filters")
 if not df.empty:
-    # Fix any missing reasons so the filter doesn't break
     df['reason'] = df['reason'].fillna("Unknown")
-    
-    # Multi-select filter for Reason
     reasons = df['reason'].unique().tolist()
     selected_reasons = st.sidebar.multiselect("Filter by Reason", reasons, default=reasons)
-    
-    # Filter the dataframe
     filtered_df = df[df['reason'].isin(selected_reasons)]
 else:
     filtered_df = df
@@ -81,14 +92,11 @@ st.divider()
 # DATA TABLE & EXPORT
 st.subheader("Recent Transactions")
 
-# Safely check which columns exist in the database before displaying
 cols_to_show = ['timestamp', 'sender_name', 'sender_phone', 'reason', 'amount', 'tax_amount']
 existing_cols = [col for col in cols_to_show if col in filtered_df.columns]
 
-# Create a clean display dataframe
 display_df = filtered_df[existing_cols].copy()
 
-# Rename columns for a cleaner look
 rename_dict = {
     'timestamp': 'Date & Time',
     'sender_name': 'Customer',
@@ -99,10 +107,8 @@ rename_dict = {
 }
 display_df.rename(columns=rename_dict, inplace=True)
 
-# Display the table (hide_index removes the ugly 0, 1, 2 numbers)
 st.dataframe(display_df, width="stretch", hide_index=True)
 
-# CSV Export Button
 if not display_df.empty:
     csv = display_df.to_csv(index=False).encode('utf-8')
     st.download_button(
