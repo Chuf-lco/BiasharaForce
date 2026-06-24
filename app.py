@@ -1,15 +1,17 @@
-import requests
 from fastapi import FastAPI, Request, Response
 from groq import Groq
 import africastalking
 from dotenv import load_dotenv
 import os
 import json
-import sqlite3
 import datetime
 from fpdf import FPDF
+import requests
+from sqlalchemy import create_engine, text
 
-# Load env vars
+# ==========================================
+# 1. INITIALIZATION & CONFIGURATION
+# ==========================================
 load_dotenv()
 
 # Initialize FastAPI
@@ -22,13 +24,11 @@ groq_client = Groq()
 AT_USERNAME = os.getenv("AT_USERNAME")
 AT_API_KEY = os.getenv("AT_API_KEY")
 
-# Debug print to see what the server is actually reading (only prints first 5 chars for safety)
 if AT_API_KEY:
     print(f"🔍 Found AT API Key starting with: {AT_API_KEY[:5]}...")
 else:
     print("❌ CRITICAL: AT_API_KEY environment variable is completely missing!")
 
-# For the cloud, we default to 'sandbox' if no username is provided
 if not AT_USERNAME:
     AT_USERNAME = "sandbox"
 
@@ -39,38 +39,31 @@ try:
 except Exception as e:
     print(f"❌ Could not initialize Africa's Talking: {e}")
     sms = None
-# ==========================================
-# 1. DATABASE SETUP
-# ==========================================
-def init_db():
-    conn = sqlite3.connect('biasharaforce.db')
-    c = conn.cursor()
-    
-    # Main transactions table
-    c.execute('''CREATE TABLE IF NOT EXISTS transactions
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                 sender_phone TEXT,
-                 sender_name TEXT,
-                 amount REAL,
-                 tax_amount REAL,
-                 reason TEXT,
-                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
-                 
-    # NEW: Pending actions table for Human-in-the-Loop
-    c.execute('''CREATE TABLE IF NOT EXISTS pending_actions
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                 action_type TEXT,
-                 action_data TEXT,
-                 status TEXT DEFAULT 'pending',
-                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
-                 
-    conn.commit()
-    conn.close()
+
+# Initialize Supabase Postgres Database
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+if not DATABASE_URL:
+    print("❌ CRITICAL: DATABASE_URL environment variable is missing!")
+    engine = None
+else:
+    # Render/SQLAlchemy requires "postgresql://" instead of "postgres://"
+    if DATABASE_URL.startswith("postgres://"):
+        DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+    try:
+        engine = create_engine(DATABASE_URL)
+        print("✅ Supabase Postgres Engine Initialized!")
+    except Exception as e:
+        print(f"❌ Failed to initialize Database Engine: {e}")
+        engine = None
 
 @app.on_event("startup")
 async def startup_event():
-    init_db()
-    print("✅ Database initialized!")
+    # Tables are already created in Supabase UI, so we just verify engine here
+    if engine:
+        print("✅ Database connection ready!")
+    else:
+        print("⚠️ Database engine not initialized. App will run but data won't be saved.")
 
 # ==========================================
 # 2. PYTHON FUNCTIONS (The Agent's Tools)
@@ -79,65 +72,74 @@ def calculate_withholding_tax(amount: float) -> float:
     return amount * 0.05
 
 def check_customer_history(sender_phone: str) -> str:
-    conn = sqlite3.connect('biasharaforce.db')
-    c = conn.cursor()
-    c.execute("SELECT sender_name, amount, reason, timestamp FROM transactions WHERE sender_phone=?", (sender_phone,))
-    rows = c.fetchall()
-    conn.close()
-    if not rows:
-        return "No past transactions found for this phone number. This is a new customer."
-    else:
-        history = f"Found {len(rows)} past transaction(s):\n"
-        for row in rows:
-            history += f"- {row[0]} paid {row[1]} for {row[2]} on {row[3]}\n"
-        return history
+    if not engine: return "Database offline"
+    try:
+        with engine.connect() as conn:
+            result = conn.execute(
+                text("SELECT sender_name, amount, reason, timestamp FROM transactions WHERE sender_phone=:phone"), 
+                {"phone": sender_phone}
+            ).fetchall()
+            
+            if not result:
+                return "No past transactions found for this phone number. This is a new customer."
+            else:
+                history = f"Found {len(result)} past transaction(s):\n"
+                for row in result:
+                    history += f"- {row[0]} paid {row[1]} for {row[2]} on {row[3]}\n"
+                return history
+    except Exception as e:
+        print(f"DB Error check_customer_history: {e}")
+        return "Error checking history."
 
 def save_transaction_to_db(sender_phone: str, sender_name: str, amount: float, tax_amount: float, reason: str) -> str:
-    conn = sqlite3.connect('biasharaforce.db')
-    c = conn.cursor()
-    c.execute("INSERT INTO transactions (sender_phone, sender_name, amount, tax_amount, reason) VALUES (?, ?, ?, ?, ?)",
-              (sender_phone, sender_name, amount, tax_amount, reason))
-    conn.commit()
-    conn.close()
-    return "Transaction saved successfully to database."
+    if not engine: return "Database offline"
+    try:
+        with engine.connect() as conn:
+            conn.execute(
+                text("INSERT INTO transactions (sender_phone, sender_name, amount, tax_amount, reason) VALUES (:phone, :name, :amount, :tax, :reason)"),
+                {"phone": sender_phone, "name": sender_name, "amount": amount, "tax": tax_amount, "reason": reason}
+            )
+            conn.commit()
+        return "Transaction saved successfully to Supabase."
+    except Exception as e:
+        print(f"DB Error save_transaction_to_db: {e}")
+        return "Error saving transaction."
 
 def generate_invoice_pdf(sender_name: str, amount: float, tax_amount: float, reason: str) -> str:
     if not os.path.exists('invoices'):
         os.makedirs('invoices')
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"invoices/invoice_{sender_name.replace(' ', '_')}_{amount}_{timestamp}.pdf"
-    pdf = FPDF()
-    pdf.add_page()
-    pdf.set_font("Helvetica", "B", 24)
-    pdf.cell(0, 20, "BIASHARAFORCE INVOICE", ln=True, align="C")
-    pdf.set_font("Helvetica", "", 12)
-    pdf.cell(0, 10, "Powered by AI Agents", ln=True, align="C")
-    pdf.ln(20)
-    pdf.set_font("Helvetica", "B", 14)
-    pdf.cell(0, 10, f"Client: {sender_name}", ln=True)
-    pdf.ln(5)
-    pdf.set_font("Helvetica", "", 12)
-    pdf.cell(0, 10, f"Description: {reason}", ln=True)
-    pdf.cell(0, 10, f"Subtotal: Ksh {amount:,.2f}", ln=True)
-    if tax_amount > 0:
-        pdf.cell(0, 10, f"Withholding Tax (5%): Ksh {tax_amount:,.2f}", ln=True)
-        pdf.cell(0, 10, f"Net Payable: Ksh {amount - tax_amount:,.2f}", ln=True)
-    else:
-        pdf.cell(0, 10, f"Total: Ksh {amount:,.2f}", ln=True)
-    pdf.output(filename)
-    return f"Invoice successfully generated at {filename}"
-
-#Audio Transcription Tool
-def transcribe_audio(audio_url: str) -> str:
-    """Downloads audio from a URL and transcribes it using Groq Whisper."""
+    
     try:
-        # 1. Download the audio file from WhatsApp
-        # In production, this URL requires authentication, but we build the logic now
+        pdf = FPDF()
+        pdf.add_page()
+        pdf.set_font("Helvetica", "B", 24)
+        pdf.cell(0, 20, "BIASHARAFORCE INVOICE", ln=True, align="C")
+        pdf.set_font("Helvetica", "", 12)
+        pdf.cell(0, 10, "Powered by AI Agents", ln=True, align="C")
+        pdf.ln(20)
+        pdf.set_font("Helvetica", "B", 14)
+        pdf.cell(0, 10, f"Client: {sender_name}", ln=True)
+        pdf.ln(5)
+        pdf.set_font("Helvetica", "", 12)
+        pdf.cell(0, 10, f"Description: {reason}", ln=True)
+        pdf.cell(0, 10, f"Subtotal: Ksh {amount:,.2f}", ln=True)
+        if tax_amount > 0:
+            pdf.cell(0, 10, f"Withholding Tax (5%): Ksh {tax_amount:,.2f}", ln=True)
+            pdf.cell(0, 10, f"Net Payable: Ksh {amount - tax_amount:,.2f}", ln=True)
+        else:
+            pdf.cell(0, 10, f"Total: Ksh {amount:,.2f}", ln=True)
+        pdf.output(filename)
+        return f"Invoice successfully generated at {filename}"
+    except Exception as e:
+        print(f"PDF Error: {e}")
+        return "Error generating PDF."
+
+def transcribe_audio(audio_url: str) -> str:
+    try:
         response = requests.get(audio_url)
         audio_content = response.content
-        
-        # 2. Send to Groq Whisper for transcription
-        # We specify 'sw' for Swahili, but Whisper is smart enough to handle English/Sheng mix
         transcription = groq_client.audio.transcriptions.create(
             file=("voice_note.ogg", audio_content),
             model="whisper-large-v3",
@@ -146,143 +148,66 @@ def transcribe_audio(audio_url: str) -> str:
         )
         print(f"🎙️ Transcription: {transcription}")
         return transcription
-        
     except Exception as e:
         print(f"❌ Error transcribing audio: {e}")
         return "Error: Could not transcribe audio."
-    
-# NEW TOOLS: Pause and Confirm Actions
+
+# HITL (Human-in-the-Loop) Tools
 def create_pending_action(action_type: str, action_data: dict) -> str:
-    """Saves a dangerous action as 'pending' so the user must confirm it."""
-    conn = sqlite3.connect('biasharaforce.db')
-    c = conn.cursor()
-    c.execute("INSERT INTO pending_actions (action_type, action_data) VALUES (?, ?)",
-              (action_type, json.dumps(action_data)))
-    conn.commit()
-    conn.close()
-    return "Action saved as pending. You MUST ask the user to confirm by replying YES."
+    if not engine: return "Database offline"
+    try:
+        with engine.connect() as conn:
+            conn.execute(
+                text("INSERT INTO pending_actions (action_type, action_data) VALUES (:type, CAST(:data AS jsonb))"),
+                {"type": action_type, "data": json.dumps(action_data)}
+            )
+            conn.commit()
+        return "Action saved as pending. You MUST ask the user to confirm by replying YES."
+    except Exception as e:
+        print(f"DB Error create_pending_action: {e}")
+        return "Error saving pending action."
 
 def confirm_pending_action() -> str:
-    """Executes the most recent pending action."""
-    conn = sqlite3.connect('biasharaforce.db')
-    c = conn.cursor()
-    c.execute("SELECT id, action_type, action_data FROM pending_actions WHERE status='pending' ORDER BY timestamp DESC LIMIT 1")
-    row = c.fetchone()
-    
-    if not row:
-        conn.close()
-        return "No pending actions to confirm."
-        
-    action_id, action_type, action_data_json = row
-    action_data = json.loads(action_data_json)
-    
-    # Mark as confirmed
-    c.execute("UPDATE pending_actions SET status='confirmed' WHERE id=?", (action_id,))
-    conn.commit()
-    conn.close()
-    
-    # Now execute the actual tools!
-    if action_type == "high_value_transaction":
-        save_transaction_to_db(**action_data)
-        generate_invoice_pdf(
-            sender_name=action_data["sender_name"],
-            amount=action_data["amount"],
-            tax_amount=action_data["tax_amount"],
-            reason=action_data["reason"]
-        )
-        return "High value transaction confirmed, saved, and invoice generated!"
-        
-    return "Action confirmed and executed."
+    if not engine: return "Database offline"
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                text("SELECT id, action_type, action_data::text FROM pending_actions WHERE status='pending' ORDER BY timestamp DESC LIMIT 1")
+            ).fetchone()
+            
+            if not row:
+                return "No pending actions to confirm."
+                
+            action_id, action_type, action_data_json = row
+            action_data = json.loads(action_data_json)
+            
+            conn.execute(text("UPDATE pending_actions SET status='confirmed' WHERE id=:id"), {"id": action_id})
+            conn.commit()
+            
+        if action_type == "high_value_transaction":
+            save_transaction_to_db(**action_data)
+            generate_invoice_pdf(
+                sender_name=action_data["sender_name"],
+                amount=action_data["amount"],
+                tax_amount=action_data["tax_amount"],
+                reason=action_data["reason"]
+            )
+            return "High value transaction confirmed, saved, and invoice generated!"
+        return "Action confirmed and executed."
+    except Exception as e:
+        print(f"DB Error confirm_pending_action: {e}")
+        return "Error confirming action."
 
 # ==========================================
 # 3. TOOL DEFINITIONS FOR THE LLM
 # ==========================================
 tools = [
-    {
-        "type": "function",
-        "function": {
-            "name": "calculate_withholding_tax",
-            "description": "Calculates the 5% Kenyan withholding tax for rent payments.",
-            "parameters": {
-                "type": "object",
-                "properties": {"amount": {"type": "number", "description": "The total rent amount received"}},
-                "required": ["amount"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "check_customer_history",
-            "description": "Checks the database for past payments from this specific phone number.",
-            "parameters": {
-                "type": "object",
-                "properties": {"sender_phone": {"type": "string", "description": "The phone number of the sender"}},
-                "required": ["sender_phone"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "save_transaction_to_db",
-            "description": "Saves the finalized transaction details to the database.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "sender_phone": {"type": "string"},
-                    "sender_name": {"type": "string"},
-                    "amount": {"type": "number"},
-                    "tax_amount": {"type": "number"},
-                    "reason": {"type": "string"}
-                },
-                "required": ["sender_phone", "sender_name", "amount", "tax_amount", "reason"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "generate_invoice_pdf",
-            "description": "Generates a PDF invoice for the transaction and saves it locally.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "sender_name": {"type": "string"},
-                    "amount": {"type": "number"},
-                    "tax_amount": {"type": "number"},
-                    "reason": {"type": "string"}
-                },
-                "required": ["sender_name", "amount", "tax_amount", "reason"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "create_pending_action",
-            "description": "Pauses a dangerous or high-value transaction and marks it as pending until the user confirms.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "action_type": {"type": "string", "description": "The type of action, e.g., 'high_value_transaction'"},
-                    "action_data": {"type": "object", "description": "The data needed to execute the action later"}
-                },
-                "required": ["action_type", "action_data"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "confirm_pending_action",
-            "description": "If the user replies YES to confirm a pending action, execute it.",
-            "parameters": {
-                "type": "object",
-                "properties": {},
-            },
-        },
-    }
+    {"type": "function", "function": {"name": "calculate_withholding_tax", "description": "Calculates the 5% Kenyan withholding tax for rent payments.", "parameters": {"type": "object", "properties": {"amount": {"type": "number", "description": "The total rent amount received"}}, "required": ["amount"]}}},
+    {"type": "function", "function": {"name": "check_customer_history", "description": "Checks the database for past payments from this specific phone number.", "parameters": {"type": "object", "properties": {"sender_phone": {"type": "string", "description": "The phone number of the sender"}}, "required": ["sender_phone"]}}},
+    {"type": "function", "function": {"name": "save_transaction_to_db", "description": "Saves the finalized transaction details to the database.", "parameters": {"type": "object", "properties": {"sender_phone": {"type": "string"}, "sender_name": {"type": "string"}, "amount": {"type": "number"}, "tax_amount": {"type": "number"}, "reason": {"type": "string"}}, "required": ["sender_phone", "sender_name", "amount", "tax_amount", "reason"]}}},
+    {"type": "function", "function": {"name": "generate_invoice_pdf", "description": "Generates a PDF invoice for the transaction and saves it locally.", "parameters": {"type": "object", "properties": {"sender_name": {"type": "string"}, "amount": {"type": "number"}, "tax_amount": {"type": "number"}, "reason": {"type": "string"}}, "required": ["sender_name", "amount", "tax_amount", "reason"]}}},
+    {"type": "function", "function": {"name": "create_pending_action", "description": "Pauses a dangerous or high-value transaction and marks it as pending until the user confirms.", "parameters": {"type": "object", "properties": {"action_type": {"type": "string", "description": "The type of action, e.g., 'high_value_transaction'"}, "action_data": {"type": "object", "description": "The data needed to execute the action later"}}, "required": ["action_type", "action_data"]}}},
+    {"type": "function", "function": {"name": "confirm_pending_action", "description": "If the user replies YES to confirm a pending action, execute it.", "parameters": {"type": "object", "properties": {}}}}
 ]
 
 # ==========================================
@@ -295,7 +220,8 @@ def process_mpesa_with_agent(sms_text: str, sender_phone: str) -> str:
     
     CRITICAL RULES FOR HUMAN-IN-THE-LOOP:
     - If the message is exactly 'YES' or 'NDIO', you MUST use the `confirm_pending_action` tool. Do not do anything else.
-    - If the transaction amount is GREATER THAN 10,000 Ksh, OR the reason contains high-value items like 'TV', 'Laptop', or 'Car', you MUST treat this as a high-value transaction. Use `create_pending_action` and ask for confirmation.
+    - If the transaction amount is GREATER THAN 10,000 Ksh, OR the reason contains high-value items like 'TV', 'Laptop', or 'Car', you MUST treat this as a high-value transaction.
+    - For high-value transactions: Check history, calculate tax if needed, but DO NOT save to DB or generate PDF. Instead, use `create_pending_action` with action_type 'high_value_transaction' and include all extracted data in action_data. Then tell the user: "This is a high-value transaction. Reply YES to confirm and generate invoice."
     
     CRITICAL RULES FOR TAX:
     - ONLY call `calculate_withholding_tax` if the Reason contains the word 'Rent'. 
@@ -306,8 +232,6 @@ def process_mpesa_with_agent(sms_text: str, sender_phone: str) -> str:
     2. Extract details. Apply Tax ONLY if Rent.
     3. Save to DB (tax will be 0 if not rent). Generate PDF.
     4. Reply with summary.
-    
-    DO NOT output code snippets. Use the tools via the API.
     """
     
     messages = [
@@ -363,17 +287,14 @@ def process_mpesa_with_agent(sms_text: str, sender_phone: str) -> str:
 @app.post("/whatsapp")
 async def at_webhook(request: Request):
     try:
-        # 1. Parse incoming form data from Africa's Talking
         form_data = await request.form()
         
-        # AT sends 'text' for SMS and 'MediaUrl0' for Voice Notes
         media_url = form_data.get("MediaUrl0")
         incoming_text = form_data.get("text", "")
         sender_phone = form_data.get("from", "")
         
         incoming_msg = ""
         
-        # 2. Handle Voice Notes vs Text
         if media_url:
             print(f"🎙️ Received Voice Note from {sender_phone}")
             incoming_msg = transcribe_audio(media_url)
@@ -384,32 +305,27 @@ async def at_webhook(request: Request):
             print("⚠️ Received empty message.")
             return Response(content="No message", status_code=200)
 
-        # 3. Process the message with your Groq Agent
         if incoming_msg and "Error:" not in incoming_msg:
             agent_reply = process_mpesa_with_agent(incoming_msg, sender_phone)
             print(f"✅ AGENT REPLY GENERATED:\n{agent_reply}")
             
-            # 4. ACTIVELY PUSH REPLY VIA AT SDK (Crucial for Cloud/SMS!)
-            # In the cloud, returning text in the HTTP response doesn't send the SMS.
-            # We must use the SDK to push the message back to the user.
             try:
-                if sms: # Check if the SDK initialized properly
+                if sms:
                     response = sms.send(agent_reply, [sender_phone])
                     print(f"📱 AT SDK Reply Sent! Response: {response}")
                 else:
-                    print("❌ SMS SDK not initialized. Check AT API Keys in Render Environment Variables.")
+                    print("❌ SMS SDK not initialized. Cannot reply.")
             except Exception as sms_error:
                 print(f"❌ Failed to send SMS via SDK: {sms_error}")
         else:
             print(f"⚠️ Skipping agent processing. Transcription failed or message was empty.")
 
-        # 5. Always return 200 OK immediately so AT stops retrying
         return Response(content="OK", status_code=200)
 
     except Exception as e:
         print(f"❌ CRITICAL ERROR IN WEBHOOK: {e}")
-        # Still return 200 OK to AT even if our code crashes, so they don't spam us
         return Response(content="Server Error", status_code=200)
+
 @app.get("/")
 async def root():
-    return {"message": "BiasharaForce HITL Agent is running!"}
+    return {"message": "BiasharaForce HITL Postgres Agent is running!"}
